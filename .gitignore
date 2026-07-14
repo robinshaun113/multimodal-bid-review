@@ -1,0 +1,8 @@
+# 真实标书含公司/项目/报价敏感信息，绝不提交到公开仓库
+data/raw/
+data/parsed/
+*.docx
+*.pdf
+.venv/
+__pycache__/
+.env
