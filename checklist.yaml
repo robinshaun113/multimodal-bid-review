@@ -1,0 +1,76 @@
+# P3 应标书审核 Checklist (Day40)
+# 说明：以下"期望值"为 IDC 行业通行基准（国标 GB50174 / Uptime Tier 等公开标准），
+#       作为默认参照。实际审核时应以【具体招标文件的要求】为准替换本值。
+# 审核 Agent 逐项：拿 query 去多模态 RAG 检索 → 对照 expect → 判达标/缺失/风险。
+
+- id: mandatory_response
+  dimension: 强制响应项
+  query: "招标要求 强制项 响应 偏离 满足"
+  expect: "对招标带▲★的强制项逐条正面响应，无负偏离、无遗漏"
+  level: 废标红线
+
+- id: room_grade
+  dimension: 关键技术指标
+  query: "机房等级 数据中心等级 国标 A级 Tier"
+  expect: "国标 GB50174 A 级 / Uptime Tier III 及以上"
+  level: 废标红线
+
+- id: sla_availability
+  dimension: 关键技术指标
+  query: "SLA 服务可用性 承诺 百分比 在线率"
+  expect: ">= 99.9%（年停机 < 8.76 小时；高等级要求 99.99%）"
+  level: 废标红线
+
+- id: rack_power_density
+  dimension: 关键技术指标
+  query: "单机柜 功率密度 kW 机架功率"
+  expect: ">= 8kW/柜（高密/液冷场景可达 20~30kW+）"
+  level: 废标红线
+
+- id: pue
+  dimension: 关键技术指标
+  query: "PUE 能耗 能效 电能利用效率"
+  expect: "<= 1.5（新建/液冷可 <= 1.3，符合双碳政策）"
+  level: 废标红线
+
+- id: power_redundancy
+  dimension: 电力/制冷承诺
+  query: "供电 冗余 2N N+1 双路 UPS 市电"
+  expect: "供电 2N 或 N+1 冗余；UPS 续航 >= 15 分钟（保障柴发启动切换）"
+  level: 废标红线
+
+- id: cooling
+  dimension: 电力/制冷承诺
+  query: "制冷 冷却 空调 精密空调 液冷 冗余"
+  expect: "制冷系统 N+1 冗余，制冷量匹配机柜功率"
+  level: 次要
+
+- id: ops_response
+  dimension: 运维服务承诺
+  query: "运维 值守 故障响应 到场 时间 7x24"
+  expect: "7×24 值守；故障响应 <= 15 分钟，到场 <= 2 小时"
+  level: 废标红线
+
+- id: topology_diagram
+  dimension: 图纸完整性(多模态特色)
+  query: "网络拓扑图 架构图 系统拓扑"
+  expect: "提供清晰的网络/电力拓扑图，体现冗余设计与关键设备"
+  level: 技术展示
+
+- id: rack_layout_diagram
+  dimension: 图纸完整性(多模态特色)
+  query: "机柜布局图 机房平面 机柜排布 分区"
+  expect: "提供机柜布局图，机柜数量/分区/功率分布清晰合理"
+  level: 技术展示
+
+- id: price_reasonableness
+  dimension: 商务/风险
+  query: "报价 价格 费用 单价 总价"
+  expect: "报价完整、明细清晰，无明显异常低价或漏项"
+  level: 废标红线
+
+- id: penalty_clause
+  dimension: 商务/风险
+  query: "违约 赔偿 罚则 SLA 未达标 补偿"
+  expect: "含 SLA 未达标的违约/补偿条款，无明显不利于甲方的表述"
+  level: 废标红线
