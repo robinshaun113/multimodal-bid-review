@@ -8,3 +8,8 @@ __pycache__/
 .env
 
 data/chroma_db/
+
+# 审核产物(含真实标书衍生内容,敏感)
+data/audit_*
+data/*.log
+data/*.json
