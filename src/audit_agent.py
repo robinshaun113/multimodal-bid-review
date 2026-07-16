@@ -93,6 +93,11 @@ def audit_all(only_id=None):
     for it in items:
         print(f"审核 [{it['id']}] {it['dimension']} ...", flush=True)
         results.append(audit_one(it, vs=vs))
+    # 存 JSON 供报告生成器(report.py)读取
+    import json
+    out = os.path.join(_ROOT, "data", "audit_result.json")
+    json.dump(results, open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    print(f"✓ 审核结果 → {out}")
     return results
 
 
