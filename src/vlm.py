@@ -27,8 +27,26 @@ _DESC_PROMPT = """你是 IDC 数据中心技术文档分析专家。请描述这
 用简洁中文描述，只讲图里真实可见的内容，看不清就说看不清，不要臆测编造。"""
 
 
+_MAX_BYTES = 2 * 1024 * 1024   # 超 2MB 就压缩(qwen-vl-max 单图有上限，超大图会 400)
+_MAX_SIDE = 2048               # 长边像素上限
+
+
 def _encode_image(image_path):
+    """图 → data URL。超大图(>2MB)先用 Pillow 等比压缩+重编码 JPEG，否则 VLM 会 400。"""
     ext = Path(image_path).suffix.lstrip(".").lower()
+
+    if os.path.getsize(image_path) > _MAX_BYTES:
+        from PIL import Image
+        import io
+        Image.MAX_IMAGE_PIXELS = None  # 本地可信标书文件，解除解压炸弹像素上限
+        img = Image.open(image_path)
+        if img.mode in ("RGBA", "P", "LA"):   # 带透明通道的 png 转 RGB 才能存 JPEG
+            img = img.convert("RGB")
+        img.thumbnail((_MAX_SIDE, _MAX_SIDE))  # 等比缩放，不超过长边
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
     mime = "jpeg" if ext in ("jpg", "jpeg") else ext
     with open(image_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()

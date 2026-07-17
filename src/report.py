@@ -72,6 +72,8 @@ def render_report(results):
 
 
 if __name__ == "__main__":
+    # Windows 终端默认 GBK，print 含 ✓/⚠ 等字符会 UnicodeEncodeError，强制 utf-8
+    sys.stdout.reconfigure(encoding="utf-8")
     if not os.path.exists(_RESULT_JSON):
         print(f"未找到 {_RESULT_JSON}，请先跑 audit_agent 生成结果 JSON"); sys.exit(1)
     results = json.load(open(_RESULT_JSON, encoding="utf-8"))

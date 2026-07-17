@@ -28,12 +28,17 @@ _COLLECTION = "bid_multimodal"
 
 
 def get_embeddings():
-    """百炼 text-embedding-v2（复用 P1 经验；check_embedding_ctx_length=False 避免报错）。"""
+    """百炼 text-embedding-v2（复用 P1 经验；check_embedding_ctx_length=False 避免报错）。
+
+    chunk_size=10：DashScope 兼容模式单次 batch 上限 25 条，全量入库时靠它分批，
+    否则 4011 条文本一次性 embed 会被服务端拒。
+    """
     return OpenAIEmbeddings(
         model="text-embedding-v2",
         api_key=os.getenv("DASHSCOPE_API_KEY"),
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         check_embedding_ctx_length=False,
+        chunk_size=10,
     )
 
 
@@ -78,6 +83,106 @@ def build_index(docx_path, text_limit=15, image_limit=10):
     return vs
 
 
+def build_full_text_index(docx_path, min_len=5):
+    """全量文本入库（Day46）：把整份标书的文本块都灌进库，修复'假缺失'。
+
+    与 build_index 的区别：
+      - build_index 是 Day39 的小批(15+10)链路验证，不代表真实召回；
+      - 本函数入全量文本(不含图，图纸维度第二段单独处理)，让文本类 checklist
+        (SLA/PUE/强制响应项…) 能真正被检索到。
+    过滤：去重 + 丢弃 <min_len 的碎片(页码/单字符/纯符号)，避免污染检索。
+    """
+    parsed = parse_docx(docx_path)
+    seen = set()
+    docs = []
+    for c in parsed["text_chunks"]:
+        t = c["text"].strip()
+        if len(t) < min_len or t in seen:
+            continue
+        seen.add(t)
+        docs.append(Document(
+            page_content=t,
+            metadata={"type": "text", "kind": c["kind"]},
+        ))
+    raw_n = len(parsed["text_chunks"])
+    print(f"文本块: 原始 {raw_n} → 去重/过滤后 {len(docs)} 个入库")
+
+    # 先清空旧库(含 Day39 的 25 条测试样本)，避免真假数据混淆
+    vs = Chroma(
+        collection_name=_COLLECTION,
+        embedding_function=get_embeddings(),
+        persist_directory=_PERSIST_DIR,
+    )
+    try:
+        vs.delete_collection()
+        print("已清空旧 collection(含 Day39 测试样本)")
+    except Exception as e:
+        print(f"清空旧库跳过: {e}")
+
+    # 分批入库(chunk_size=10 控制 embedding batch；Chroma add 再按 500 一批持久化)
+    vs = Chroma(
+        collection_name=_COLLECTION,
+        embedding_function=get_embeddings(),
+        persist_directory=_PERSIST_DIR,
+    )
+    B = 500
+    for i in range(0, len(docs), B):
+        vs.add_documents(docs[i:i + B])
+        print(f"  已入库 {min(i + B, len(docs))}/{len(docs)}")
+    print(f"[OK] 全量文本入库完成 -> {_PERSIST_DIR}")
+    return vs
+
+
+def _pick_images(image_chunks, sample=60):
+    """图抽样(Day46)：信号弱(无图-文位置关联)，只能靠图自身特征粗筛。
+      - 排除 emf/wmf：qwen-vl-max 不支持矢量格式(实测 400)，要读得先转 png(遗留)
+      - jpeg/png 按文件大小 top 取(大图更可能是拓扑/机柜布局，小图多为图标)
+    返回抽样后的 image_chunks 子集。
+    """
+    raster = [im for im in image_chunks if im["ext"] in ("jpeg", "jpg", "png")]
+    skipped = len(image_chunks) - len(raster)
+    raster.sort(key=lambda im: os.path.getsize(im["image_path"]), reverse=True)
+    picked = raster[:sample]
+    print(f"图抽样: 全{len(image_chunks)}张 → 位图{len(raster)}张(排除矢量{skipped}) → 抽top{len(picked)}张")
+    return picked
+
+
+def build_image_index(docx_path, sample=60):
+    """追加图入库(Day46)：不动已入库的文本，只把抽样图经 VLM 转描述后 add 进去。
+    修复'图纸维度 VLM 缺席'——让审核真正基于 VLM 读图，而非文本里搜'提到图'。
+    """
+    parsed = parse_docx(docx_path)
+    picked = _pick_images(parsed["image_chunks"], sample=sample)
+
+    vs = load_index()  # 追加，不清空(文本还在里面)
+    # 可重入：先删已有 image 记录(避免多次跑重复入库)，文本保留不动
+    try:
+        vs.delete(where={"type": "image"})
+    except Exception as e:
+        print(f"清理旧图记录跳过: {e}")
+    docs, ok, fail = [], 0, 0
+    for i, im in enumerate(picked, 1):
+        desc = describe_image(im["image_path"])
+        if desc.startswith("[VLM失败]"):
+            fail += 1
+            print(f"  [{i}/{len(picked)}] 跳过 {im['rid']}: {desc[:40]}")
+            continue
+        docs.append(Document(
+            page_content=desc,
+            metadata={"type": "image", "image_path": im["image_path"], "rid": im["rid"]},
+        ))
+        ok += 1
+        if i % 10 == 0 or i == len(picked):
+            print(f"  [{i}/{len(picked)}] 已描述 {ok} 张(失败 {fail})")
+        # 每 20 张 flush 一次入库，防中途挂全丢
+        if len(docs) >= 20:
+            vs.add_documents(docs); docs = []
+    if docs:
+        vs.add_documents(docs)
+    print(f"[OK] 图入库完成: 成功 {ok} 张, 失败 {fail} 张")
+    return vs
+
+
 def load_index():
     """加载已建好的向量库。"""
     return Chroma(
@@ -87,10 +192,15 @@ def load_index():
     )
 
 
-def query(question, k=4, vs=None):
-    """检索：返回命中条目。图(type=image)顺 image_path 带回原图路径。"""
+def query(question, k=4, vs=None, only_type=None):
+    """检索：返回命中条目。图(type=image)顺 image_path 带回原图路径。
+
+    only_type='text'/'image' 时按 metadata 过滤(Day46)：图入库后会挤占文本类
+    审核项的检索窗口，故文本类维度只检 text、图纸维度才检 image，避免互相污染。
+    """
     vs = vs or load_index()
-    hits = vs.similarity_search(question, k=k)
+    flt = {"type": only_type} if only_type else None
+    hits = vs.similarity_search(question, k=k, filter=flt)
     results = []
     for h in hits:
         t = h.metadata.get("type")
@@ -108,6 +218,7 @@ def query(question, k=4, vs=None):
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")  # Windows GBK 终端防 UnicodeEncodeError
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "build":
         docx = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
@@ -116,6 +227,23 @@ if __name__ == "__main__":
         if not files:
             print("data/raw 无 docx"); sys.exit(1)
         build_index(files[0])
+    elif cmd == "build_full":
+        docx = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
+        import glob
+        files = glob.glob(os.path.join(docx, "*.docx"))
+        if not files:
+            print("data/raw 无 docx"); sys.exit(1)
+        print(f"全量文本入库: {os.path.basename(files[0])}")
+        build_full_text_index(files[0])
+    elif cmd == "build_images":
+        docx = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
+        import glob
+        files = glob.glob(os.path.join(docx, "*.docx"))
+        if not files:
+            print("data/raw 无 docx"); sys.exit(1)
+        sample = int(sys.argv[2]) if len(sys.argv) > 2 else 60
+        print(f"图入库(抽样{sample}): {os.path.basename(files[0])}")
+        build_image_index(files[0], sample=sample)
     elif cmd == "query":
         q = sys.argv[2] if len(sys.argv) > 2 else "机柜布局"
         print(f"问题: {q}\n" + "=" * 50)

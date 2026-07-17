@@ -43,9 +43,18 @@ def _get_llm():
     ).with_structured_output(AuditResult, method="function_calling")
 
 
-def audit_one(item, vs=None, k=4):
-    """审一项：检索 → LLM 对照 expect 判断（防幻觉）。返回 dict。"""
-    hits = query(item["query"], k=k, vs=vs)
+def audit_one(item, vs=None, k=8):
+    """审一项：检索 → LLM 对照 expect 判断（防幻觉）。返回 dict。
+
+    k=8（Day46 从 4 上调）：全量入库后库里多碎片(标题/表头)，k=4 时实质内容
+    常被关键词高度匹配的标题挤出证据窗口，导致'二次假缺失'。
+
+    按维度定向检索(Day46)：只有"图纸完整性"维度需要 VLM 图描述，其余文本类
+    维度只检 text——否则图描述会挤占文本证据窗口，反而漏掉文本承诺(如罚则条款)。
+    """
+    is_diagram = "图纸" in item["dimension"]
+    only_type = None if is_diagram else "text"
+    hits = query(item["query"], k=k, vs=vs, only_type=only_type)
     # 把检索到的证据(文本内容 / 图描述)拼成上下文
     evidence = []
     for h in hits:
@@ -97,11 +106,12 @@ def audit_all(only_id=None):
     import json
     out = os.path.join(_ROOT, "data", "audit_result.json")
     json.dump(results, open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    print(f"✓ 审核结果 → {out}")
+    print(f"[OK] 审核结果 -> {out}")
     return results
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")  # Windows GBK 终端防 UnicodeEncodeError
     only = sys.argv[1] if len(sys.argv) > 1 else None
     res = audit_all(only_id=only)
     print("\n" + "=" * 60)
