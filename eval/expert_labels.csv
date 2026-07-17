@@ -1,0 +1,13 @@
+id,ai_conclusion,expert_conclusion,note
+mandatory_response,风险,,
+room_grade,达标,,
+sla_availability,达标,,
+rack_power_density,达标,,
+pue,风险,,
+power_redundancy,风险,,
+cooling,风险,,
+ops_response,风险,,
+topology_diagram,风险,,
+rack_layout_diagram,达标,,
+price_reasonableness,风险,,
+penalty_clause,达标,,

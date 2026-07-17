@@ -13,3 +13,6 @@ data/chroma_db/
 data/audit_*
 data/*.log
 data/*.json
+
+# 评估工作表含标书原文片段(AI理由/出处直接引用),敏感;脚本与结论CSV模板可提交
+eval/eval_sheet.md
