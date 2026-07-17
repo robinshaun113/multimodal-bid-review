@@ -34,8 +34,13 @@ _TEMPLATE = """# 应标书审核报告
 {% for g in groups %}## 二、{{ g.title }}
 {% for r in g.rows %}
 ### {{ r.icon }} {{ r.dimension }}（{{ r.id }}） — **{{ r.conclusion }}**
+{% if r.tender_quote %}- **招标要求**：{{ r.tender_quote }}
+{% endif %}
 - **理由**：{{ r.reason }}
-- **出处**：{{ r.source }}
+- **应标证据**：{% if r.citations %}{% for c in r.citations %}`{{ c.evidence_id }}` {{ c.quote }}{% if not loop.last %}；{% endif %}{% endfor %}{% else %}无{% endif %}
+- **引用校验**：{{ "通过" if r.citation_valid else "未通过，需人工复核" }}
+{% if r.deterministic_rule and r.deterministic_rule.status in ["pass", "fail"] %}- **数值规则复核**：{{ r.deterministic_rule.reason }}
+{% endif %}
 {% endfor %}
 {% endfor %}"""
 
@@ -58,8 +63,11 @@ def render_report(results):
         if rows:
             groups.append({"title": lv, "rows": rows})
 
-    n_redline_bad = sum(1 for r in results
-                        if r["level"] == "废标红线" and r["conclusion"] in ("缺失", "风险"))
+    n_redline_bad = sum(
+        1 for r in results
+        if (r.get("mandatory") or r["level"] == "废标红线")
+        and r["conclusion"] in ("缺失", "风险")
+    )
     md = Template(_TEMPLATE).render(
         total=len(results),
         n_pass=sum(1 for r in results if r["conclusion"] == "达标"),

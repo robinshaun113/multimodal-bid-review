@@ -12,12 +12,7 @@ eval/faithfulness.py — 忠实度/抗幻觉检查 (Day45 评估三·全自动)
 用法：python eval/faithfulness.py
 """
 import os
-import sys
 import json
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from multimodal_rag import query, load_index
-from audit_agent import load_checklist
 
 _ROOT = os.path.join(os.path.dirname(__file__), "..")
 _RESULT = os.path.join(_ROOT, "data", "audit_result.json")
@@ -25,49 +20,40 @@ _OUT = os.path.join(os.path.dirname(__file__), "faithfulness_report.md")
 
 
 def check():
-    import chromadb
     results = {x["id"]: x for x in json.load(open(_RESULT, encoding="utf-8"))}
-    # 抗幻觉正确定义：AI引的出处是否在【整个知识库】里真实存在(不是某次检索窗口)
-    col = chromadb.PersistentClient(
-        path=os.path.join(_ROOT, "data", "chroma_db")).get_collection("bid_multimodal")
-    allc = col.get(include=["documents", "metadatas"])
-    all_text = "\n".join(allc["documents"])
-    all_rids = {(m or {}).get("rid") for m in allc["metadatas"]
-                if (m or {}).get("type") == "image"}
-
     rows, grounded, honest, bad = [], 0, 0, 0
     for cid, r in results.items():
-        src = (r.get("source") or "").strip()
-        if src in ("", "无"):
-            tag = "no-ev-honest" if r["conclusion"] == "缺失" else "no-src?"
-            if tag == "no-ev-honest":
-                honest += 1
-        elif src.startswith("[图"):
-            rid = src[2:].strip("] ").split()[0]
-            tag, cnt = ("grounded", 1) if rid in all_rids else ("UNGROUNDED‼️", 0)
-            grounded += cnt; bad += (1 - cnt)
+        cited = {c["evidence_id"] for c in r.get("citations", [])}
+        retrieved = set(r.get("retrieved_evidence_ids", []))
+        invalid = cited - retrieved
+        if invalid or not r.get("citation_valid", False):
+            tag = "UNGROUNDED‼️"
+            bad += 1
+        elif cited:
+            tag = "grounded-in-run"
+            grounded += 1
+        elif r["conclusion"] == "缺失":
+            tag = "no-ev-honest"
+            honest += 1
         else:
-            body = src.split("]", 1)[-1].strip() if src.startswith("[") else src
-            body = body.replace("…", "").replace("...", "").strip()  # LLM引用常带省略号
-            anchor = body[:15]
-            tag, cnt = ("grounded", 1) if anchor and anchor in all_text else ("UNGROUNDED‼️", 0)
-            grounded += cnt; bad += (1 - cnt)
+            tag = "no-src?"
+            bad += 1
         rows.append((cid, r["conclusion"], tag))
 
     n = len(rows)
     lines = ["# Day45 忠实度检查（全自动，抗幻觉）\n",
-             f"> 样本：1 份标书 × {n} 项。只验'出处是否真实检索所得'，不判对错。\n",
+             f"> 样本：1 份标书 × {n} 项。验证引用是否来自该项实际证据窗口，不判审核对错。\n",
              "| 审核项 | 结论 | 出处是否有据 |", "|---|---|---|"]
     for cid, c, tag in rows:
         lines.append(f"| {cid} | {c} | {tag} |")
     lines += [
         "\n## 汇总",
-        f"- 有据(grounded)：{grounded}/{n}",
+        f"- 当次证据窗口内有据(grounded-in-run)：{grounded}/{n}",
         f"- 诚实判缺失(source=无+结论缺失)：{honest}/{n}",
         f"- 疑似幻觉(UNGROUNDED)：{bad}/{n}",
-        f"\n**结论**：{grounded + honest}/{n} 项出处可追溯或诚实空缺，"
-        f"疑似幻觉 {bad} 项。防幻觉铁律{'通过' if bad == 0 else '有漏，需查'}。",
-        "\n> 局限：本轴只证'没编造出处'，**不等于判断正确**。"
+        f"\n**结论**：{grounded + honest}/{n} 项引用受当次检索证据约束或诚实空缺，"
+        f"未溯源引用 {bad} 项。",
+        "\n> 局限：本轴只证'引用没有越出当次证据窗口'，**不等于判断正确，也不等于零幻觉**。"
         "真实漏检/误检率需招标方专家读整份标书比对，样本 1 份不宣称统计意义。",
     ]
     open(_OUT, "w", encoding="utf-8").write("\n".join(lines))

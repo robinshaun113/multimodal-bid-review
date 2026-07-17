@@ -11,6 +11,7 @@ src/multimodal_rag.py — 多模态 RAG (Day39)
 """
 import os
 import sys
+import hashlib
 
 from dotenv import load_dotenv
 from langchain_core.documents import Document
@@ -20,11 +21,39 @@ from langchain_chroma import Chroma
 sys.path.insert(0, os.path.dirname(__file__))
 from docx_parser import parse_docx
 from vlm import describe_image
+from schemas import stable_id
 
 load_dotenv(override=True)
 
 _PERSIST_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "chroma_db")
 _COLLECTION = "bid_multimodal"
+
+
+def document_id(docx_path: str) -> str:
+    """Hash document content without loading a several-hundred-MB file into memory."""
+    digest = hashlib.sha256()
+    with open(docx_path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()[:16]
+
+
+def collection_name(doc_id: str | None = None) -> str:
+    return f"bid_response_{doc_id}" if doc_id else _COLLECTION
+
+
+def _text_metadata(parsed: dict, chunk: dict, ordinal: int) -> dict:
+    source = parsed["meta"]["source"]
+    block_index = int(chunk.get("block_index", ordinal))
+    return {
+        "type": "text",
+        "source": source,
+        "document_id": parsed["meta"]["document_id"],
+        "kind": chunk["kind"],
+        "block_index": block_index,
+        "section": chunk.get("section", ""),
+        "evidence_id": stable_id("ev", source, block_index, chunk["text"]),
+    }
 
 
 def get_embeddings():
@@ -83,7 +112,7 @@ def build_index(docx_path, text_limit=15, image_limit=10):
     return vs
 
 
-def build_full_text_index(docx_path, min_len=5):
+def build_full_text_index(docx_path, min_len=5, doc_id=None):
     """全量文本入库（Day46）：把整份标书的文本块都灌进库，修复'假缺失'。
 
     与 build_index 的区别：
@@ -95,21 +124,23 @@ def build_full_text_index(docx_path, min_len=5):
     parsed = parse_docx(docx_path)
     seen = set()
     docs = []
-    for c in parsed["text_chunks"]:
+    for ordinal, c in enumerate(parsed["text_chunks"]):
         t = c["text"].strip()
         if len(t) < min_len or t in seen:
             continue
         seen.add(t)
         docs.append(Document(
             page_content=t,
-            metadata={"type": "text", "kind": c["kind"]},
+            metadata=_text_metadata(parsed, c, ordinal),
         ))
     raw_n = len(parsed["text_chunks"])
     print(f"文本块: 原始 {raw_n} → 去重/过滤后 {len(docs)} 个入库")
 
     # 先清空旧库(含 Day39 的 25 条测试样本)，避免真假数据混淆
+    doc_id = doc_id or parsed["meta"]["document_id"]
+    target_collection = collection_name(doc_id)
     vs = Chroma(
-        collection_name=_COLLECTION,
+        collection_name=target_collection,
         embedding_function=get_embeddings(),
         persist_directory=_PERSIST_DIR,
     )
@@ -121,7 +152,7 @@ def build_full_text_index(docx_path, min_len=5):
 
     # 分批入库(chunk_size=10 控制 embedding batch；Chroma add 再按 500 一批持久化)
     vs = Chroma(
-        collection_name=_COLLECTION,
+        collection_name=target_collection,
         embedding_function=get_embeddings(),
         persist_directory=_PERSIST_DIR,
     )
@@ -129,7 +160,7 @@ def build_full_text_index(docx_path, min_len=5):
     for i in range(0, len(docs), B):
         vs.add_documents(docs[i:i + B])
         print(f"  已入库 {min(i + B, len(docs))}/{len(docs)}")
-    print(f"[OK] 全量文本入库完成 -> {_PERSIST_DIR}")
+    print(f"[OK] 全量文本入库完成 -> {_PERSIST_DIR} / {target_collection}")
     return vs
 
 
@@ -147,14 +178,15 @@ def _pick_images(image_chunks, sample=60):
     return picked
 
 
-def build_image_index(docx_path, sample=60):
+def build_image_index(docx_path, sample=60, doc_id=None, vs=None):
     """追加图入库(Day46)：不动已入库的文本，只把抽样图经 VLM 转描述后 add 进去。
     修复'图纸维度 VLM 缺席'——让审核真正基于 VLM 读图，而非文本里搜'提到图'。
     """
     parsed = parse_docx(docx_path)
     picked = _pick_images(parsed["image_chunks"], sample=sample)
 
-    vs = load_index()  # 追加，不清空(文本还在里面)
+    doc_id = doc_id or parsed["meta"]["document_id"]
+    vs = vs or load_index(doc_id)  # 追加，不清空(文本还在里面)
     # 可重入：先删已有 image 记录(避免多次跑重复入库)，文本保留不动
     try:
         vs.delete(where={"type": "image"})
@@ -167,9 +199,21 @@ def build_image_index(docx_path, sample=60):
             fail += 1
             print(f"  [{i}/{len(picked)}] 跳过 {im['rid']}: {desc[:40]}")
             continue
+        block_index = im.get("block_index")
+        metadata = {
+            "type": "image",
+            "source": parsed["meta"]["source"],
+            "document_id": doc_id,
+            "image_path": im["image_path"],
+            "rid": im["rid"],
+            "section": im.get("section", ""),
+            "evidence_id": stable_id("evimg", parsed["meta"]["source"], im["rid"], desc),
+        }
+        if block_index is not None:
+            metadata["block_index"] = int(block_index)
         docs.append(Document(
             page_content=desc,
-            metadata={"type": "image", "image_path": im["image_path"], "rid": im["rid"]},
+            metadata=metadata,
         ))
         ok += 1
         if i % 10 == 0 or i == len(picked):
@@ -183,10 +227,10 @@ def build_image_index(docx_path, sample=60):
     return vs
 
 
-def load_index():
+def load_index(doc_id=None):
     """加载已建好的向量库。"""
     return Chroma(
-        collection_name=_COLLECTION,
+        collection_name=collection_name(doc_id),
         embedding_function=get_embeddings(),
         persist_directory=_PERSIST_DIR,
     )
@@ -211,9 +255,20 @@ def query(question, k=4, vs=None, only_type=None):
                 "desc": h.page_content,
                 "image_path": h.metadata.get("image_path"),  # ← 找回的原图
                 "rid": h.metadata.get("rid"),
+                "evidence_id": h.metadata.get("evidence_id"),
+                "source": h.metadata.get("source"),
+                "section": h.metadata.get("section", ""),
+                "block_index": h.metadata.get("block_index"),
             })
         else:
-            results.append({"type": "text", "content": h.page_content})
+            results.append({
+                "type": "text",
+                "content": h.page_content,
+                "evidence_id": h.metadata.get("evidence_id"),
+                "source": h.metadata.get("source"),
+                "section": h.metadata.get("section", ""),
+                "block_index": h.metadata.get("block_index"),
+            })
     return results
 
 

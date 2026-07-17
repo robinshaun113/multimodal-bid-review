@@ -1,114 +1,116 @@
-# 多模态 IDC 应标技术标书智能审核
+# 多模态 IDC 招投标合规审核
 
-> VLM 读图（拓扑/机柜布局）+ docx 解析 + 多模态 RAG，按 checklist 审核应标书的响应完整性与技术达标性。
+> 面向 AI 解决方案工程师作品集的端到端项目：从招标文件抽取强制要求，
+> 在应标文件的文本、表格和图片中寻找证据，输出可追溯的需求—响应合规矩阵。
 
-## 为什么做这个
+## 业务问题
 
-在中国移动 IDC 实习期间，我做过一项重复且吃业务经验的活：拿着招标要求逐条核对应标技术标书——机房等级够不够 A 级、SLA 有没有承诺到 99.9%、供电是不是 N+1 冗余、偏离表有没有逐条正面响应。一份标书几百页、几百张图（拓扑图、机柜布局图），人工审既慢又容易漏。
+IDC 招投标审核不是“总结一份文档”，而是同时回答三个问题：
 
-应标书天生**图多**（乙方要秀方案，含大量拓扑/机柜布局图），这正是纯文本 RAG 接不住、必须上多模态的场景——**图是这个项目的灵魂**。
+1. 招标方究竟要求了什么，哪些是★/▲/必须项？
+2. 应标方在哪里作出了响应，文本、表格和拓扑图是否一致？
+3. 哪些判断可以自动完成，哪些废标风险必须由人确认？
 
-## 它做什么
+系统因此支持两种模式：
 
-上传一份 `.docx` 应标技术标书，系统自动跑完五环 pipeline，产出一份分维度的审核报告（废标红线优先、不合格项钉顶）。
+- **招标—应标对照**：上传两份 DOCX，从招标文件动态抽取要求并核对应标证据。
+- **行业基准扫描**：只上传应标文件，使用 `checklist.yaml` 做风险预检。
 
+## 架构
+
+```text
+招标 DOCX ─→ 保序解析 ─→ 需求抽取 ───────────────┐
+                                                 ├─→ Requirement × Evidence 合规矩阵
+应标 DOCX ─→ 文本/表格/图片解析 ─→ 证据索引 ─────┘          │
+                                                             ↓
+                                  LangGraph 并行审核 → 引用校验 → HITL → 报告
 ```
-docx 应标书
-   │
-   ├─① docx 解析      python-docx 抽文本(段落+表格) + 解压 word/media 取内嵌图
-   │
-   ├─② 多模态入库      文本 → embedding 直接入库
-   │                  图  → VLM(qwen-vl-max) 读成文字描述 → embedding 入库(metadata 拴原图)
-   │
-   ├─③ 逐项检索        每条 checklist 用 query 去向量库检索；按维度定向(文本项只检文本)
-   │
-   ├─④ 审核 Agent      检索证据 + expect 标准 → LLM 判 达标/风险/缺失（防幻觉：只依据原文）
-   │
-   └─⑤ 报告生成        Jinja2 渲染，结论摘要钉顶 + 废标红线优先
-```
 
-## 技术栈
+核心设计：
 
-- **VLM**：qwen-vl-max（读拓扑/机柜/证书图 → 结构化描述）
-- **Embedding / LLM**：text-embedding-v2 / qwen3-max（DashScope）
-- **向量库**：Chroma（文本 + 图描述统一入库，type 字段区分）
-- **解析 / 图像**：python-docx、Pillow（超大图压缩）
-- **前端 / 部署**：Gradio、Docker
+- **文档结构**：保留段落/表格阅读顺序、标题章节、block index 和图片 OOXML 锚点。
+- **证据契约**：每个文本块和图片拥有稳定 `evidence_id`；LLM 只能引用本次检索窗口中的 ID。
+- **混合判定**：LLM 负责语义理解；代码对“≥99.99%”“≤30 分钟”等唯一数值阈值做保守复核，歧义场景不强判。
+- **双文档审核**：要求来源于招标文件；静态 Checklist 仅作为无招标文件时的基准。
+- **可靠执行**：LangGraph `Send` 并行审核要求，节点重试；废标红线可通过 `interrupt()` 人工确认。
+- **数据隔离**：应标文件按内容哈希使用独立 Chroma collection，避免不同用户互相污染。
 
-## 这个项目最值钱的部分：一次真实的排雷
+## 当前技术栈
 
-第一版审核报告显示「12 项废标红线里 9 项缺失」——一份真实中标级标书不可能全崩。顺着证据挖，挖出**四层"假缺失"**，每层都是不同的检索/数据管道问题：
+- LangChain / LangGraph 1.2 / Pydantic structured output
+- Chroma 文本证据索引
+- Qwen3.7-Plus：招标需求抽取与合规判断
+- qwen-vl-max：图片描述基线
+- `qwen3-vl-embedding`：原生以文搜图实验轨道，独立评测后再决定是否默认融合
+- python-docx / OOXML relationship / Gradio / Docker
 
-| 层 | 表象 | 根因 | 修复 |
-|---|---|---|---|
-| ① | 9 项缺失 | 库只入了 25 条测试样本，真实标书 4011 文本块没进库 | 全量文本入库（分批绕过 batch 上限） |
-| ② | 仍 5 项缺失 | k=4 太小，标题/表头碎片挤占检索窗口，实质内容被挤出 | k=4→8 |
-| ③ | SLA/制冷仍缺失 | query 词汇鸿沟：checklist 写「SLA 可用性」，标书写「业务连续性 99.99%」 | query 用行业同义词扩展 |
-| ④ | 罚则项从达标退步 | 图描述入库后挤占了文本项的检索窗口 | 按维度定向检索（文本项只检文本） |
+## 为什么不是“所有新技术都默认开启”
 
-**核心认知：检索为空 ≠ 内容缺失。** 做审核/评估前必须先验证数据管道的每一环，否则结论全错。这套排雷方法论，比"我搭了个多模态系统"经得起追问。
+当前图片主链路仍保留“VLM 描述 → 文本向量”基线，同时新增
+`src/native_multimodal.py` 作为原生跨模态检索实验轨道。只有在图片 Recall@K
+证明有收益后，才将其与文本检索融合。GraphRAG、Agent Swarm 和更换向量数据库
+不解决当前核心问题，因此不为技术标签引入。
 
-## 评估（诚实标注）
+## 评测设计
 
-P3 是**审核任务**，没有现成 gold answer——真实"漏检/误检"的基准是读过整份标书的领域专家。所以评估分三轴，各归其位：
+评测分四层，避免用一个“准确率”掩盖不同错误：
 
-| 轴 | 方式 | 结果 |
-|---|---|---|
-| **召回诊断** | 全自动：k=8 证据 vs 深捞 k=25 | 12 项中 10 项 k=8 外仍有关键证据，标出高危复核点 |
-| **忠实度（抗幻觉）** | 全自动：AI 出处是否在知识库真实存在 | **12/12 有据，0 幻觉** |
-| **对错判断** | 专家填 `eval/expert_labels.csv` → 算一致率/漏检率/误检率 | 需人工，样本 1 份不宣称统计意义 |
+| 层 | 指标 |
+|---|---|
+| 需求抽取 | 强制项召回率、阈值/单位抽取正确率 |
+| 证据检索 | 文本 Recall@K、图片 Recall@K |
+| 合规判断 | 废标风险召回率、漏检率、误报率 |
+| 引用可信 | citation 是否属于该次检索窗口、quote 是否命中对应 evidence |
 
-> ⚠️ 忠实度只证「没编造出处」，**不等于判断正确**；样本量为 1 份标书 × 12 项，方法论验证级。
+旧版“12/12、0 幻觉”只能说明短引用在全库存在，已停止作为简历结论。新版
+`eval/faithfulness.py` 验证引用是否属于**该审核项实际看到的证据窗口**，但仍明确：
+引用可追溯不等于判断正确。
+
+建议公开评测使用脱敏变体：删除 SLA、修改 PUE、取消 N+1、移除拓扑图等，
+构造有明确 gold label 的 Requirement × Document 数据集。
 
 ## 运行
 
-### 本地
-
 ```bash
 pip install -r requirements.txt
-cp .env.example .env          # 填入 DASHSCOPE_API_KEY
-python app.py                 # 浏览器打开 http://localhost:7860
+copy .env.example .env
+python app.py
 ```
 
-命令行方式（不用前端）：
-
-```bash
-python src/multimodal_rag.py build_full          # 全量文本入库
-python src/multimodal_rag.py build_images 20     # 抽样 20 张图 VLM 读图入库
-python src/audit_agent.py                        # 逐项审核 → data/audit_result.json
-python src/report.py                             # 生成 data/audit_report.md
-```
-
-### Docker
+打开 `http://localhost:7860`，上传招标文件（可选）和应标文件。
 
 ```bash
 docker build -t bid-review .
 docker run -p 7860:7860 -e DASHSCOPE_API_KEY=sk-xxx bid-review
 ```
 
-> DashScope 是国内服务：若开代理，需将 `dashscope.aliyuncs.com` 设为直连/规则模式，
-> 否则全局代理绕境外会导致 `APIConnectionError`。
+## 数据与安全边界
 
-## 数据安全
-
-真实应标书含公司名/项目/报价等敏感信息，**全部本地处理、绝不入公开仓**：
-`data/raw`（原始标书）、`data/parsed`（抽出的图）、`data/chroma_db`（向量+图描述）、
-审核产物与 `eval/eval_sheet.md`（引用标书原文）均已 `.gitignore` 挡死。
-作为求职作品公开时，演示截图中的公司名/报价需打码或替换。
+- 原始文件、解析图片、向量库和审核产物均被 `.gitignore` 排除。
+- 文件与产物保存在本地，但选定文本和图片会发送到百炼云端 API 推理。
+- 敏感标书应先脱敏，或将模型接口替换为企业私有化部署。
+- Gradio 页面无鉴权，仅用于本机或可信内网演示。
 
 ## 目录
 
+```text
+src/
+  docx_parser.py           保序 DOCX/表格/图片锚点解析
+  requirement_extractor.py 招标要求结构化抽取
+  schemas.py               Requirement/Evidence/Citation 契约
+  multimodal_rag.py        文本+图片描述证据索引
+  native_multimodal.py     qwen3-vl-embedding 原生以文搜图实验
+  audit_agent.py           单项合规判断与窗口级引用校验
+  rules.py                 SLA/比例/时长等确定性数值复核
+  review_workflow.py       LangGraph 并行、重试、HITL
+  report.py                合规矩阵报告
+tests/                     无模型调用的契约和流程测试
+eval/                      召回、引用、人工标签评测
 ```
-src/          docx_parser · vlm · multimodal_rag · audit_agent · report
-eval/         recall_probe(召回诊断) · faithfulness(抗幻觉) · make_eval_sheet · score_eval
-checklist.yaml  审核清单(12 项，5 维度)
-app.py        Gradio 前端
-docs/design.md  需求与设计
-```
 
-## 已知局限
+## 已知边界
 
-- **拓扑图**：多为 emf 矢量格式，qwen-vl-max 不支持，需先转 png（当前拓扑维度靠文本判断）。
-- **图抽样**：docx 解析丢失了图-文位置关联，只能按格式/大小粗筛，非语义抽样。
-- **分块**：docx 表格按行切，长表被拆成碎片行，影响强制响应项等表格类审核的召回。
-
+- DOCX 是流式排版格式，可靠页码需要先渲染为 PDF，再接布局解析/OCR。
+- EMF/WMF 仍需转换为 PNG；当前解析器会保留其锚点，但 VLM 不直接读取。
+- 原生多模态索引已具备代码路径，尚需公开图片 gold set 证明收益。
+- 招标需求抽取和最终合规准确率仍需脱敏数据集与人工复核扩充。

@@ -16,28 +16,94 @@ import zipfile
 from pathlib import Path
 
 import docx  # python-docx
+from docx.document import Document as _Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+from docx.oxml.text.paragraph import CT_P
+from docx.oxml.table import CT_Tbl
+from docx.oxml.ns import qn
+
+
+def iter_blocks(parent):
+    """Yield paragraphs and tables in their original document order."""
+    parent_elm = parent.element.body if isinstance(parent, _Document) else parent._tc
+    for child in parent_elm.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, parent)
 
 
 def extract_text_chunks(doc):
-    """按段落 + 表格抽文本，过滤空段。返回 [{text, kind}]。"""
+    """Preserve paragraph/table order, heading context and stable block indexes."""
     chunks = []
-    for para in doc.paragraphs:
-        t = para.text.strip()
-        if t:
-            chunks.append({"text": t, "kind": "paragraph"})
-    for ti, table in enumerate(doc.tables):
-        for row in table.rows:
+    section = ""
+    table_index = 0
+    for block_index, block in enumerate(iter_blocks(doc)):
+        if isinstance(block, Paragraph):
+            text = block.text.strip()
+            style = (block.style.name or "") if block.style else ""
+            if style.lower().startswith(("heading", "标题")) and text:
+                section = text
+            if text:
+                chunks.append(
+                    {
+                        "text": text,
+                        "kind": "paragraph",
+                        "block_index": block_index,
+                        "section": section,
+                        "style": style,
+                    }
+                )
+            continue
+
+        rows = []
+        for row in block.rows:
             cells = [c.text.strip() for c in row.cells]
-            line = " | ".join(c for c in cells if c)
-            if line:
-                chunks.append({"text": line, "kind": f"table{ti}"})
+            if any(cells):
+                rows.append(" | ".join(cells))
+        if rows:
+            chunks.append(
+                {
+                    "text": "\n".join(rows),
+                    "kind": "table",
+                    "table_index": table_index,
+                    "block_index": block_index,
+                    "section": section,
+                }
+            )
+        table_index += 1
     return chunks
 
 
-def extract_images(docx_path, out_dir):
+def _image_anchors(doc):
+    """Map OOXML relationship IDs to nearby section/block context."""
+    anchors: dict[str, list[dict]] = {}
+    section = ""
+    for block_index, block in enumerate(iter_blocks(doc)):
+        if not isinstance(block, Paragraph):
+            continue
+        text = block.text.strip()
+        style = (block.style.name or "") if block.style else ""
+        if style.lower().startswith(("heading", "标题")) and text:
+            section = text
+        for blip in block._p.xpath(".//a:blip"):
+            rel_id = blip.get(qn("r:embed"))
+            if not rel_id or rel_id not in doc.part.rels:
+                continue
+            target = doc.part.rels[rel_id].target_ref
+            name = os.path.basename(target)
+            anchors.setdefault(name, []).append(
+                {"block_index": block_index, "section": section, "paragraph": text[:200]}
+            )
+    return anchors
+
+
+def extract_images(docx_path, out_dir, doc=None):
     """docx=zip，从 word/media/ 提取内嵌图到 out_dir。返回 [{image_path, rid, ext}]。"""
     os.makedirs(out_dir, exist_ok=True)
     imgs = []
+    anchors = _image_anchors(doc) if doc is not None else {}
     with zipfile.ZipFile(docx_path) as z:
         media = [n for n in z.namelist() if n.startswith("word/media/")]
         for n in media:
@@ -48,7 +114,16 @@ def extract_images(docx_path, out_dir):
             dst = os.path.join(out_dir, name)
             with z.open(n) as src, open(dst, "wb") as f:
                 f.write(src.read())
-            imgs.append({"image_path": dst, "rid": name, "ext": ext})
+            nearby = anchors.get(name, [])
+            first = nearby[0] if nearby else {}
+            imgs.append({
+                "image_path": dst,
+                "rid": name,
+                "ext": ext,
+                "anchors": nearby,
+                "block_index": first.get("block_index"),
+                "section": first.get("section", ""),
+            })
     return imgs
 
 
@@ -59,12 +134,17 @@ def parse_docx(docx_path, image_out_dir=None):
         image_out_dir = str(Path(docx_path).parent.parent / "parsed" / "images")
     doc = docx.Document(docx_path)
     text_chunks = extract_text_chunks(doc)
-    image_chunks = extract_images(docx_path, image_out_dir)
+    image_chunks = extract_images(docx_path, image_out_dir, doc=doc)
+    digest = __import__("hashlib").sha256()
+    with open(docx_path, "rb") as source_file:
+        for block in iter(lambda: source_file.read(1024 * 1024), b""):
+            digest.update(block)
     return {
         "text_chunks": text_chunks,
         "image_chunks": image_chunks,
         "meta": {
             "source": os.path.basename(docx_path),
+            "document_id": digest.hexdigest()[:16],
             "n_text": len(text_chunks),
             "n_image": len(image_chunks),
         },
