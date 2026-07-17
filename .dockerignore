@@ -1,0 +1,16 @@
+# 绝不打进镜像：真实标书 + 衍生敏感数据 + 密钥
+data/raw/
+data/parsed/
+data/chroma_db/
+data/audit_*
+data/*.json
+data/*.log
+eval/eval_sheet.md
+*.docx
+*.pdf
+.env
+.venv/
+__pycache__/
+*.pyc
+.git/
+图纸/
